@@ -1,63 +1,69 @@
 ---
-name: approx-sketches
-description: How arrowtap builds per-file sketches and answers PRECISION=approx queries with bounds — partitioning, sidecar schema, query-shape classifier, bounds math, and tests. Use when editing src/arrowtap/approx/, data/sketches.py, data/partition.py.
+name: vounit-checker
+description: Rules, diagnostic codes, and test catalogue for the ADQL unit/UCD checker (dimensional analysis at compile time, unit propagation, UCD autocomplete). Use when editing src/arrowtap/units/, tests/units/, or adding a rule.
 ---
 
-# Approximate answers from sketches
+# VOUnit / UCD checker
 
-## Partitioning
+## Model
 
-- Column `hpx2` = HEALPix order-2 nested index, derived from Gaia `source_id`: `hpx12 = source_id // 34359738368`, then `hpx2 = hpx12 >> 20` (order 12 → 2 drops 10 levels × 2 bits).
-- One Parquet file per `hpx2` value (48 files). Row-group size 128k. zstd.
-- Synthetic data must generate `source_id` consistent with `ra, dec` so the derivation holds (use `healpy` or `astropy_healpix` in `data synth`, test the round trip).
+- Walk the ADQL AST bottom-up. Each expression node gets `(unit | None, ucd | None)`.
+- Column units come from `tap_schema.yaml`, parsed with `astropy.units.Unit(s, format="vounit")`. Empty or unparseable unit → `None` (unknown). Unknown is silent; count it for the coverage report.
+- Numeric literals are **dimensionless-adaptive**: in `+ - < > = BETWEEN` they adopt the other operand's unit. In `* /` they are dimensionless.
+- The checker reports. It never rewrites the query.
 
-## Sidecar: `data/sketches.parquet`
+## Rules
 
-| Column | Type |
-|---|---|
-| `file` | utf8 (relative path) |
-| `hpx2` | int32 |
-| `column` | utf8 |
-| `kind` | utf8: `cpc`, `kll`, `stats` |
-| `blob` | binary (serialized sketch; null for `stats`) |
-| `rows`, `nulls` | int64 |
-| `min`, `max` | float64 (null for non-numeric) |
-| `lg_k` / `k` | int32 sketch parameter |
-
-Build with DuckDB + `datasketches` community extension, one `GROUP BY` per file and column. CPC for every column used in `COUNT(DISTINCT)` demos (`source_id`, a low-cardinality `has_xp`, a binned magnitude). KLL for every float column.
-
-Gate 0 records exact function names (create, union, estimate, bounds, quantile, CDF, rank error) for the pinned extension version. Use those names only through `approx/store.py` so a rename touches one file.
-
-## Classifier (`approx/classify.py`)
-
-Input: AST. Output: `ApproxPlan | NotApplicable(code, reason)`.
-
-Accept only:
-- one table, no joins, no subqueries;
-- select list of `COUNT(*)`, `MIN/MAX(col)`, `COUNT(DISTINCT col)`, `arrowtap_quantile(col, q)`, `arrowtap_histogram(col, lo, hi, n)`, optionally `hpx2`;
-- `WHERE` built only from `hpx2 = k`, `hpx2 IN (...)`, `hpx2 BETWEEN a AND b`, combined with AND/OR;
-- `GROUP BY hpx2` or none.
-
-Reject codes: `A001 not applicable: <reason>` (run exact), `A002 sketch store missing` (run exact), `A003 column has no sketch of the needed kind` (run exact).
-
-## Answers and bounds
-
-| Aggregate | Merge | Value | Bounds |
+| Code | Level | Rule | Suggestion in message |
 |---|---|---|---|
-| `COUNT(*)` | sum `rows` | exact | none (`tap:precision` stays `approx` for the response, field metadata `arrowtap:exact=true`) |
-| `MIN/MAX` | min/max of stats | exact | `arrowtap:exact=true` |
-| `COUNT(DISTINCT)` | CPC union | estimate | `arrowtap:lower`, `arrowtap:upper` at 2 std dev |
-| `arrowtap_quantile` | KLL union | quantile | `arrowtap:rank_error` (normalized) |
-| `arrowtap_histogram` | KLL union, CDF at edges × total rows | bin counts | per-bin ± `2 * rank_error * total_rows` |
+| U001 | error | `+ - comparisons BETWEEN` on units with different physical type | — |
+| U002 | error | Same physical type, different scale (deg vs arcsec, mas/yr vs arcsec/yr) | conversion factor, e.g. `* 3600` |
+| U003 | error | `SIN COS TAN` argument has angle unit other than rad | wrap in `RADIANS()` |
+| U004 | error | `EXP`, `POWER` exponent not dimensionless | — |
+| U005 | error | Geometry radius/size (`CIRCLE`, `BOX`) is a column with non-deg angle unit | conversion factor |
+| W010 | warn | `mag + mag` (addition of magnitudes) | colours are differences; sums are usually a mistake |
+| W011 | warn | `AVG` or `SUM` over `mag` | flux-average differs from magnitude-average |
+| W020 | warn | UCD rule: arithmetic between `pos.eq.ra` and `pos.eq.dec` | — |
+| W021 | warn | UCD rule: comparing `pos.eq.ra` to `pos.eq.dec` | — |
 
-Histogram returns one row per bin: `bin_lo`, `bin_hi`, `count`, `count_lo`, `count_hi`.
+Propagation:
 
-## Tests
+- `* /` multiply units. `RADIANS(deg)` → rad, `DEGREES(rad)` → deg. `ASIN ACOS ATAN ATAN2` → rad.
+- `LOG LOG10 SQRT` of a dimensional value: **no diagnostic**; `LOG*` → dimensionless, `SQRT` → unit**0.5. (Astronomy uses `LOG10(1000/parallax)` routinely; flagging it breaks invariant 5.)
+- `mag - mag` → mag, UCD `phot.color` if both operands are `phot.mag`.
+- Aggregates keep the unit, except `COUNT` → dimensionless.
+- Output unit string: `unit.to_string("vounit")`.
 
-- `test_bounds.py`: 100 random subsets of `hpx2` values (seeded). For each aggregate, exact DuckDB answer must sit inside bounds in ≥ 95 cases.
-- `test_classify.py`: one accept and one reject case per rule.
-- `test_store.py`: serialize → union → estimate equals single-pass sketch over the same rows (within sketch determinism).
+## Catalogue (tests/units/catalogue.yaml)
 
-## Demo
+Each entry: `id`, `adql`, `expect` (list of codes, empty = must be clean), optional `out_unit` per column.
 
-Bench page toggle "approx then exact": sends `PRECISION=approx`, renders histogram with error bars and latency; then fires the exact query and overlays it. 100M synthetic rows (`data synth --rows 100000000`) is where the latency gap is visible.
+| id | ADQL | expect |
+|---|---|---|
+| ra_plus_pm | `SELECT ra + pmra FROM gaia` | U001 |
+| dist_vs_parallax | `... WHERE DISTANCE(POINT('ICRS',ra,dec), POINT('ICRS',10,20)) < parallax` | U001 |
+| sin_deg | `SELECT SIN(dec) FROM gaia` | U003 |
+| pm_vs_rv | `... WHERE pmra > radial_velocity` | U001 |
+| deg_vs_arcsec | `... WHERE ABS(dec - b) < pos_err_arcsec` (schema col in arcsec) | U002 |
+| exp_dim | `SELECT EXP(parallax) FROM gaia` | U004 |
+| mag_sum | `SELECT phot_g_mean_mag + bp_rp FROM gaia` | W010 |
+| avg_mag | `SELECT AVG(phot_g_mean_mag) FROM gaia` | W011 |
+| ra_plus_dec | `SELECT ra + dec FROM gaia` | W020 |
+| circle_arcsec_col | `... CIRCLE('ICRS', ra, dec, pos_err_arcsec)` | U005 |
+| abs_mag | `SELECT phot_g_mean_mag + 5*LOG10(parallax/1000) + 5 FROM gaia` (parallax mas) | clean; this sums mag with dimensionless terms via adaptive literals and a LOG result, so it must not trigger W010 |
+| color | `SELECT phot_bp_mean_mag - phot_rp_mean_mag FROM gaia` | clean, out_unit mag |
+| pm_cosdec | `SELECT pmra * COS(RADIANS(dec)) FROM gaia` | clean, out_unit mas/yr |
+| inv_parallax | `SELECT 1000/parallax AS d FROM gaia` | clean, out_unit mas**-1 |
+| literal_cmp | `... WHERE phot_g_mean_mag < 15 AND dec BETWEEN -5 AND 5` | clean |
+
+W010 fires only when **both** operands carry `mag` from columns or mag-typed expressions, not when one side is dimensionless.
+
+Add a clean case for every new rule (AGENTS invariant 5).
+
+## UCD autocomplete
+
+`/arrowtap/complete?ucd=X&table=T`: return columns whose UCD contains `X` as a word (`;`-separated atoms, primary first). Rank primary-atom matches above secondary. Include `meta.main` ties first.
+
+## Coverage report
+
+`arrowtap check --coverage` prints per table: columns with parseable unit / total, columns with UCD / total. Run it on any real TAP_SCHEMA before claiming results.
